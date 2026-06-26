@@ -1,0 +1,90 @@
+# Stack de Telemetria (InfluxDB v2) — para CPUs antigas, SEM AVX2.
+# Use esta variante quando o host NÃO tiver AVX2 (ex.: Intel Sandy/Ivy Bridge).
+# Em hardware moderno (AVX2), prefira o pacote v3.
+#
+# Suba com:  ./instalar.sh   (faz o setup do InfluxDB v2 e sobe tudo)
+#
+# Serviços:
+#   influxdb2        — banco + UI web nativa  (API e interface em :8086)
+#   telegraf-huawei  — coleta passiva Huawei MDT  (escuta :57400)
+#   telegraf-gnmi    — coleta ativa gNMI (Juniper/Arista/Cisco) + métricas locais
+#
+# Opcional (perfil "nokia"): gnmic para dial-out Nokia.
+#   docker compose --profile nokia up -d
+
+services:
+  influxdb2:
+    image: influxdb:2.7
+    container_name: influxdb2
+    ports:
+      - "8086:8086"
+    environment:
+      # Auto-setup no primeiro boot (cria org, bucket, usuário e token).
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_ADMIN_USER}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_ADMIN_PASSWORD}
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUX_ORG}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUX_BUCKET}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUX_TOKEN}
+      - DOCKER_INFLUXDB_INIT_RETENTION=0
+    volumes:
+      - ./data:/var/lib/influxdb2
+    restart: unless-stopped
+    networks:
+      - telemetria
+
+  # --- Coleta PASSIVA Huawei (dial-out gRPC MDT) -----------------------------
+  # Mesma imagem do pacote v3 (o plugin escreve via API InfluxDB v2, que serve
+  # tanto para v2 quanto v3). Os equipamentos Huawei EMPURRAM os dados.
+  telegraf-huawei:
+    image: ${HUAWEI_IMAGE:-ghcr.io/bamboo-core/telemetria:latest}
+    container_name: telegraf-huawei
+    network_mode: host
+    environment:
+      - INFLUX_TOKEN=${INFLUX_TOKEN}
+      - INFLUX_ORG=${INFLUX_ORG}
+      - INFLUX_BUCKET=${INFLUX_BUCKET}
+      - INFLUX_URL=${INFLUX_URL:-http://127.0.0.1:8086}
+    volumes:
+      - ./telegraf-huawei.conf:/etc/telegraf/telegraf.conf:ro
+    restart: unless-stopped
+    depends_on:
+      - influxdb2
+
+  # --- Coleta ATIVA gNMI (Juniper / Arista / Cisco) + métricas locais --------
+  # A VM CONECTA em cada equipamento. Cadastre os devices em telegraf.d/ a partir
+  # dos modelos em exemplos/ e preencha as credenciais no .env.
+  telegraf-gnmi:
+    image: telegraf:1.32
+    container_name: telegraf-gnmi
+    env_file: .env
+    environment:
+      - INFLUX_TOKEN=${INFLUX_TOKEN}
+      - INFLUX_ORG=${INFLUX_ORG}
+      - INFLUX_BUCKET=${INFLUX_BUCKET}
+      - INFLUX_URL=http://influxdb2:8086
+    volumes:
+      - ./telegraf-gnmi.conf:/etc/telegraf/telegraf.conf:ro
+      - ./telegraf.d:/etc/telegraf/telegraf.d:ro
+    restart: unless-stopped
+    depends_on:
+      - influxdb2
+    networks:
+      - telemetria
+
+  # --- OPCIONAL: Nokia dial-out via gnmic (perfil "nokia") -------------------
+  gnmic-nokia:
+    image: ghcr.io/openconfig/gnmic:latest
+    container_name: gnmic-nokia
+    profiles: ["nokia"]
+    network_mode: host
+    command: ["--config", "/app/gnmic.yaml", "subscribe"]
+    volumes:
+      - ./gnmic.yaml:/app/gnmic.yaml:ro
+    restart: unless-stopped
+    depends_on:
+      - influxdb2
+
+networks:
+  telemetria:
+    driver: bridge
